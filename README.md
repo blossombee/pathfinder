@@ -1,17 +1,15 @@
-# Path Finder
+# API Path Finder
 
-Path Finder is a Go program that discovers API endpoints by scanning URLs from text files and performing HTTP requests with parameter fuzzing. It also supports recursive discovery by parsing JavaScript and HTML content for additional paths.
+A simple Go tool to find API endpoints by scanning URLs from local files and testing them on a target server.
 
-## Features
+- Reads URL paths from `.txt` files in `web-content/`
+- Sends HTTP requests and detects valid API responses (JSON or other data)
+- Prints each discovered URL live to the terminal
+- Saves results in a JSON file named after the base URL
 
-- Reads URLs from `.txt` files in a `Discovery` folder
-- Sends HTTP requests with multiple methods and parameter payloads
-- Filters results based on HTTP status and response content
-- Parses JavaScript and HTML responses to find new API paths
-- Supports concurrency with configurable worker count
-- Shows progress bar and outputs results to a file and table
+## usage
 
-## Usage
-
-```bash
-go run main.go
+1. Put URL paths in `.txt` files inside the `web-content` folder.
+2. Run the program and enter the base URL when prompted.
+3. View discovered URLs in the terminal as they are found.
+4. Check the generated JSON file for full results.

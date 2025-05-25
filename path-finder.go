@@ -2,9 +2,11 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -14,9 +16,9 @@ import (
 	"time"
 
 	"github.com/cheggaaa/pb/v3"
+	"github.com/common-nighthawk/go-figure"
 	"github.com/fatih/color"
 	"github.com/olekukonko/tablewriter"
-	"github.com/common-nighthawk/go-figure"
 )
 
 var (
@@ -31,6 +33,13 @@ var (
 
 var parameterPayloads = []string{"?id=1", "?user=admin", "?q=test"}
 
+type APIResult struct {
+	URL     string `json:"url"`
+	Method  string `json:"method"`
+	Status  int    `json:"status"`
+	Snippet string `json:"snippet"`
+}
+
 func main() {
 	reader := bufio.NewReader(os.Stdin)
 
@@ -38,7 +47,7 @@ func main() {
 	infoColor := color.New(color.FgHiMagenta)
 	errorColor := color.New(color.FgRed)
 
-	baseDir := "Discovery"
+	baseDir := "web-content"
 	if fi, err := os.Stat(baseDir); err != nil || !fi.IsDir() {
 		errorColor.Printf("Error: Base directory '%s' does not exist or is not accessible.\n", baseDir)
 		return
@@ -54,6 +63,8 @@ func main() {
 		}
 		errorColor.Println("Base URL cannot be empty.")
 	}
+
+	baseURL = ensureScheme(baseURL)
 
 	fmt.Print("Enter number of workers (default 20): ")
 	workerNumInput, _ := reader.ReadString('\n')
@@ -75,32 +86,22 @@ func main() {
 		}
 	}
 
-	fmt.Print("Enter output file name (default found_apis.txt): ")
-	outFileInput, _ := reader.ReadString('\n')
-	outFile := strings.TrimSpace(outFileInput)
-	if outFile == "" {
-		outFile = "found_apis.txt"
-	}
+	jsonFileName := sanitizeFilename(baseURL) + "_found_apis.json"
 
 	fmt.Println()
 	fmt.Println()
 
-	// Create a purple color printer for the title
+	// ASCII art title in purple
 	purple := color.New(color.FgMagenta, color.Bold)
-
-	// Create ASCII art figure
 	figure := figure.NewFigure("Path Finder", "", true)
 	asciiLines := strings.Split(figure.String(), "\n")
-
-	// Print each ASCII art line in purple
 	for _, line := range asciiLines {
 		purple.Println(line)
 	}
-
 	fmt.Println()
 	infoColor.Println("Starting URL discovery...")
 
-	notFoundFingerprint = getNotFoundFingerprint(strings.TrimRight(baseURL, "/") + "/this_path_should_not_exist_123456789")
+	notFoundFingerprint = getNotFoundFingerprint(baseURL + "/this_path_should_not_exist_123456789")
 
 	urls, err := collectURLs(baseDir, baseURL)
 	if err != nil {
@@ -121,15 +122,10 @@ func main() {
 	}
 	seenMutex.Unlock()
 
-	file, err := os.Create(outFile)
-	if err != nil {
-		errorColor.Printf("Error creating output file: %v\n", err)
-		return
-	}
-	defer file.Close()
+	// Slice to store results for JSON output
+	var results []APIResult
+	var resultsMutex sync.Mutex
 
-	var tableData [][]string
-	var tableMutex sync.Mutex
 	client := &http.Client{Timeout: 10 * time.Second}
 
 	methods := []string{"GET", "HEAD"}
@@ -137,15 +133,19 @@ func main() {
 	allowedStatus := map[int]bool{200: true, 201: true, 204: true}
 
 	var wg sync.WaitGroup
+	var tableData [][]string
+	var tableMutex sync.Mutex
+
 	for i := 0; i < workerNum; i++ {
 		wg.Add(1)
-		go worker(linesChan, &wg, bar, file, &tableData, &tableMutex, client, methods, allowedStatus, headers, delay, discoveredChan)
+		go worker(linesChan, &wg, bar, &results, &resultsMutex, &tableData, &tableMutex, client, methods, allowedStatus, headers, delay, discoveredChan)
 	}
 
 	go func() {
 		for _, url := range urls {
 			linesChan <- url
 		}
+		close(linesChan)
 	}()
 
 	go func() {
@@ -163,13 +163,62 @@ func main() {
 	wg.Wait()
 	bar.Finish()
 
+	// Write all results to JSON file
+	file, err := os.Create(jsonFileName)
+	if err != nil {
+		errorColor.Printf("Error creating output JSON file: %v\n", err)
+		return
+	}
+	defer file.Close()
+
+	enc := json.NewEncoder(file)
+	enc.SetIndent("", "  ")
+	err = enc.Encode(results)
+	if err != nil {
+		errorColor.Printf("Error encoding JSON: %v\n", err)
+		return
+	}
+
 	fmt.Println()
 	renderTable(tableData)
 	infoColor.Printf("\nScan complete.\nTotal files scanned: %d\nTotal URLs checked: %d\nAPI endpoints found: %d\nResults saved to %s\n",
-		totalFiles, totalURLs, apiEndpoints, outFile)
+		totalFiles, totalURLs, apiEndpoints, jsonFileName)
 }
 
-// rest of your functions unchanged...
+func ensureScheme(rawURL string) string {
+	rawURL = strings.TrimSpace(rawURL)
+	if strings.HasPrefix(rawURL, "http://") || strings.HasPrefix(rawURL, "https://") {
+		return rawURL
+	}
+
+	tryURL := "https://" + rawURL
+	resp, err := http.Head(tryURL)
+	if err == nil && resp.StatusCode < 400 {
+		resp.Body.Close()
+		return tryURL
+	}
+
+	// fallback to http
+	return "http://" + rawURL
+}
+
+func sanitizeFilename(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		rawURL = strings.ReplaceAll(rawURL, "://", "_")
+		rawURL = strings.ReplaceAll(rawURL, "/", "_")
+		return rawURL
+	}
+
+	host := u.Hostname()
+	path := strings.ReplaceAll(u.Path, "/", "_")
+	if path == "" {
+		path = "root"
+	}
+	filename := host + path
+	filename = regexp.MustCompile(`[^a-zA-Z0-9_\-\.]`).ReplaceAllString(filename, "")
+	return filename
+}
 
 func collectURLs(baseDir, baseURL string) ([]string, error) {
 	var urls []string
@@ -204,7 +253,6 @@ func getNotFoundFingerprint(url string) string {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
-		fmt.Printf("Error getting 404 fingerprint: %v\n", err)
 		return ""
 	}
 	defer resp.Body.Close()
@@ -226,7 +274,21 @@ func discoverFromJSorHTML(urlStr string, body string) []string {
 	return discovered
 }
 
-func worker(linesChan <-chan string, wg *sync.WaitGroup, bar *pb.ProgressBar, file *os.File, tableData *[][]string, tableMutex *sync.Mutex, client *http.Client, methods []string, allowedStatus map[int]bool, headers map[string]string, delay time.Duration, discoveredChan chan<- string) {
+func worker(
+	linesChan <-chan string,
+	wg *sync.WaitGroup,
+	bar *pb.ProgressBar,
+	results *[]APIResult,
+	resultsMutex *sync.Mutex,
+	tableData *[][]string,
+	tableMutex *sync.Mutex,
+	client *http.Client,
+	methods []string,
+	allowedStatus map[int]bool,
+	headers map[string]string,
+	delay time.Duration,
+	discoveredChan chan<- string,
+) {
 	defer wg.Done()
 
 	for url := range linesChan {
@@ -249,22 +311,43 @@ func worker(linesChan <-chan string, wg *sync.WaitGroup, bar *pb.ProgressBar, fi
 				resp.Body.Close()
 				bodyStr := string(bodyBytes)
 
-				if _, ok := allowedStatus[resp.StatusCode]; ok && !sameContent(bodyStr, notFoundFingerprint) {
-					apiFoundMutex.Lock()
-					apiEndpoints++
-					apiFoundMutex.Unlock()
-
-					file.WriteString(fmt.Sprintf("URL: %s\nMethod: %s\nStatus: %d\nResponse:\n%s\n\n-----\n\n", fuzzURL, method, resp.StatusCode, bodyStr))
-					snippet := bodyStr
-					if len(snippet) > 100 {
-						snippet = snippet[:100] + "..."
-					}
-					tableMutex.Lock()
-					*tableData = append(*tableData, []string{fuzzURL, method, strconv.Itoa(resp.StatusCode), snippet})
-					tableMutex.Unlock()
+				contentType := resp.Header.Get("Content-Type")
+				if !allowedStatus[resp.StatusCode] || sameContent(bodyStr, notFoundFingerprint) ||
+					strings.Contains(strings.ToLower(contentType), "html") {
+					bar.Increment()
+					continue
 				}
 
-				if strings.Contains(resp.Header.Get("Content-Type"), "javascript") || strings.Contains(resp.Header.Get("Content-Type"), "html") {
+				apiFoundMutex.Lock()
+				apiEndpoints++
+				apiFoundMutex.Unlock()
+
+				// Prepare snippet
+				snippet := bodyStr
+				if len(snippet) > 100 {
+					snippet = snippet[:100] + "..."
+				}
+
+				// Print immediately to terminal
+				fmt.Printf("[FOUND] %s %s %d\n", fuzzURL, method, resp.StatusCode)
+
+				// Save result to slice
+				resultsMutex.Lock()
+				*results = append(*results, APIResult{
+					URL:     fuzzURL,
+					Method:  method,
+					Status:  resp.StatusCode,
+					Snippet: snippet,
+				})
+				resultsMutex.Unlock()
+
+				// Add to table for summary
+				tableMutex.Lock()
+				*tableData = append(*tableData, []string{fuzzURL, method, strconv.Itoa(resp.StatusCode), snippet})
+				tableMutex.Unlock()
+
+				// Discover new paths from JSON or JS (optional)
+				if strings.Contains(strings.ToLower(contentType), "javascript") || strings.Contains(strings.ToLower(contentType), "json") {
 					discovered := discoverFromJSorHTML(fuzzURL, bodyStr)
 					for _, u := range discovered {
 						discoveredChan <- u
